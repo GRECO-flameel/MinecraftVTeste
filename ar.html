@@ -1,0 +1,299 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>RA – Câmera</title>
+
+  <!-- A-Frame (motor 3D) + MindAR (reconhecimento de imagem) -->
+  <script src="https://aframe.io/releases/1.5.0/aframe.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/mind-ar@1.2.5/dist/mindar-image-aframe.prod.js"></script>
+
+  <style>
+    html, body { margin: 0; height: 100%; overflow: hidden; font-family: system-ui, sans-serif; touch-action: none; }
+    canvas, video { touch-action: none; }
+    #hud {
+      position: fixed; left: 0; right: 0; bottom: 0; z-index: 10;
+      display: flex; flex-direction: column; align-items: center; gap: 10px;
+      padding: 16px; background: linear-gradient(transparent, rgba(0,0,0,.75));
+      color: #fff; text-align: center;
+    }
+    #status { font-size: 15px; }
+    #status.ok { color: #7CFFB2; font-weight: 600; }
+    #nome { font-size: 20px; font-weight: 700; }
+    button {
+      border: 0; border-radius: 999px; padding: 12px 20px; font-size: 15px; font-weight: 600;
+      background: rgba(255,255,255,.2); color: #fff; cursor: pointer;
+    }
+    .linha { display: flex; gap: 8px; flex-wrap: wrap; justify-content: center; }
+    #modo.quebrar { background: #E5533D; }
+    #modo.colocar { background: #3FA34D; }
+    #tipo { background: #FFD84D; color: #111; }
+    #dica { font-size: 13px; color: #ddd; }
+  </style>
+
+  <script>
+    // ===== Componente "mundo-de-blocos": monta a cena com cubos texturizados =====
+    const TAM = 0.1; // tamanho de cada bloco (a imagem-alvo tem 1 unidade de largura)
+
+    // textura de cada face: [+x, -x, topo, baixo, +z, -z]
+    const TIPOS = {
+      grama:      ['grama_lado','grama_lado','grama_topo','terra','grama_lado','grama_lado'],
+      terra:      'terra',
+      tronco:     ['tronco_lado','tronco_lado','tronco_topo','tronco_topo','tronco_lado','tronco_lado'],
+      folhas:     'folhas',
+      tabuas:     'tabuas',
+      pedra:      'pedra',
+      pedregulho: 'pedregulho',
+      agua:       'agua',
+      areia:      'areia'
+    };
+
+    // Mapa do chão 8x8 (camada de cima). G=grama, A=água, S=areia
+    const CHAO = [
+      'GGGGGGGG',
+      'GGGGSSSG',
+      'GGGSAASG',
+      'GGGSAASG',
+      'GGGGSSGG',
+      'GGGGGGGG',
+      'GGGGGGGG',
+      'GGGGGGGG'
+    ];
+
+    AFRAME.registerComponent('mundo-de-blocos', {
+      init() {
+        const THREE = AFRAME.THREE;
+        const loader = new THREE.TextureLoader();
+        const geo = new THREE.BoxGeometry(TAM, TAM, TAM);
+        const cacheMat = {}, texturas = {};
+
+        // brilho fixo por face (+x, -x, topo, baixo, +z, -z) para dar volume aos blocos
+        const BRILHO = [0.8, 0.8, 1.0, 0.5, 0.65, 0.65];
+
+        const material = (nome, b = 1) => {
+          const chave = nome + b;
+          if (cacheMat[chave]) return cacheMat[chave];
+          const tex = texturas[nome] || (texturas[nome] = loader.load('assets/blocos/' + nome + '.png'));
+          tex.magFilter = THREE.NearestFilter;   // mantém o visual "pixelado"
+          tex.minFilter = THREE.NearestFilter;
+          tex.colorSpace = THREE.SRGBColorSpace;
+          const transparente = nome === 'folhas' || nome === 'agua';
+          return cacheMat[chave] = new THREE.MeshBasicMaterial({
+            map: tex,
+            color: new THREE.Color(b, b, b),
+            transparent: nome === 'agua',
+            opacity: nome === 'agua' ? 0.85 : 1,
+            alphaTest: nome === 'folhas' ? 0.5 : 0,
+            side: transparente ? THREE.DoubleSide : THREE.FrontSide
+          });
+        };
+
+        const grupo = new THREE.Group();
+        const mapa = new Map(); // "x,y,z" -> bloco (para saber onde já tem bloco)
+        const chave = (x, y, z) => x + ',' + y + ',' + z;
+
+        const bloco = (tipo, x, y, z) => {
+          if (mapa.has(chave(x, y, z))) return null;
+          const t = TIPOS[tipo];
+          const mats = BRILHO.map((b, i) => material(Array.isArray(t) ? t[i] : t, b));
+          const m = new THREE.Mesh(geo, mats);
+          // centraliza o grid 8x8 em cima da imagem
+          m.position.set((x - 3.5) * TAM, (y + 0.5) * TAM, (z - 3.5) * TAM);
+          m.userData = { tipo, x, y, z };
+          grupo.add(m);
+          mapa.set(chave(x, y, z), m);
+          return m;
+        };
+
+        // ===== Funções usadas pelos botões / toques =====
+        this.grupo = grupo;
+        this.colocar = bloco;
+        this.quebrar = (m) => {
+          if (m.userData.y === 0) return false; // camada de baixo é indestrutível (tipo "bedrock")
+          grupo.remove(m);
+          mapa.delete(chave(m.userData.x, m.userData.y, m.userData.z));
+          return true;
+        };
+        this.reiniciar = () => {
+          grupo.clear();
+          mapa.clear();
+          construir();
+        };
+
+        const construir = () => {
+        // Camadas do chão: terra embaixo + grama/água/areia em cima
+        for (let z = 0; z < 8; z++) {
+          for (let x = 0; x < 8; x++) {
+            bloco('terra', x, 0, z);
+            const c = CHAO[z][x];
+            bloco(c === 'A' ? 'agua' : c === 'S' ? 'areia' : 'grama', x, 1, z);
+          }
+        }
+
+        // Árvore: tronco de 4 blocos + copa de folhas
+        const tx = 2, tz = 5;
+        for (let y = 2; y <= 5; y++) bloco('tronco', tx, y, tz);
+        for (let y = 4; y <= 7; y++) {
+          const r = y <= 5 ? 2 : 1;
+          for (let dx = -r; dx <= r; dx++) {
+            for (let dz = -r; dz <= r; dz++) {
+              if (y <= 5 && dx === 0 && dz === 0) continue;              // lugar do tronco
+              if (Math.abs(dx) === r && Math.abs(dz) === r && (y === 5 || y === 7)) continue; // cantos arredondados
+              bloco('folhas', tx + dx, y, tz + dz);
+            }
+          }
+        }
+
+        // Detalhes: pilha de pedra, bloco de tábuas e um murinho de pedregulho
+        bloco('pedra', 6, 2, 6); bloco('pedra', 7, 2, 6); bloco('pedra', 7, 2, 7); bloco('pedra', 7, 3, 7);
+        bloco('tabuas', 5, 2, 7); bloco('tabuas', 6, 2, 7);
+        for (let x = 0; x < 4; x++) bloco('pedregulho', x, 2, 0);
+        };
+
+        construir();
+        this.el.setObject3D('mesh', grupo);
+      }
+    });
+
+  </script>
+</head>
+<body>
+  <div id="hud">
+    <div id="nome">⛏️ Mundo de Blocos</div>
+    <div id="status">📷 Aponte a câmera para a imagem-alvo</div>
+    <div id="dica">Toque num bloco para quebrar · arraste para girar</div>
+    <div class="linha">
+      <button id="modo" class="quebrar">⛏️ Quebrar</button>
+      <button id="tipo" style="display:none">🪵 Tábuas</button>
+    </div>
+    <div class="linha">
+      <button id="reiniciar">🔄 Reiniciar</button>
+      <button onclick="location.href='index.html'">Voltar</button>
+    </div>
+  </div>
+
+  <a-scene
+    mindar-image="imageTargetSrc: assets/bloco.mind; uiScanning: no; uiLoading: yes; filterMinCF: 0.0001; filterBeta: 0.001; missTolerance: 10"
+    color-space="sRGB"
+    renderer="colorManagement: true; antialias: true"
+    vr-mode-ui="enabled: false"
+    device-orientation-permission-ui="enabled: false">
+
+    <a-camera position="0 0 0" look-controls="enabled: false"></a-camera>
+
+    <a-light type="ambient" intensity="0.7"></a-light>
+    <a-light type="directional" position="1 2 3" intensity="0.9"></a-light>
+
+    <!-- Tudo aqui dentro aparece "colado" na imagem-alvo -->
+    <a-entity id="alvo" mindar-image-target="targetIndex: 0">
+      <!-- rotation 90 0 0: o "chão" fica deitado sobre a imagem e os blocos crescem para fora dela -->
+      <a-entity mundo-de-blocos rotation="90 0 0"></a-entity>
+    </a-entity>
+  </a-scene>
+
+  <script>
+    const status = document.getElementById('status');
+    const alvo = document.getElementById('alvo');
+    alvo.addEventListener('targetFound', () => {
+      status.textContent = '✅ Imagem reconhecida!';
+      status.className = 'ok';
+    });
+    alvo.addEventListener('targetLost', () => {
+      status.textContent = '📷 Aponte a câmera para a imagem-alvo';
+      status.className = '';
+    });
+
+    // Girar o mundo para todos os lados arrastando o dedo (ou o mouse)
+    // os eixos vêm da câmera (da tela do celular), então o giro segue o dedo
+    // não importa de que lado você esteja olhando a imagem nem como o mundo já esteja girado
+    const mundo = document.querySelector('[mundo-de-blocos]');
+    const cam = document.querySelector('a-camera');
+    const T = AFRAME.THREE, q = new T.Quaternion(), qCam = new T.Quaternion(), qPai = new T.Quaternion(), dir = new T.Vector3();
+    const DIREITA = new T.Vector3(1, 0, 0), CIMA = new T.Vector3(0, 1, 0);
+    const girar = (eixoTela, graus) => {
+      const o = mundo.object3D;
+      cam.object3D.getWorldQuaternion(qCam);
+      o.parent.getWorldQuaternion(qPai);
+      dir.copy(eixoTela).applyQuaternion(qCam).applyQuaternion(qPai.invert()).normalize(); // eixo da tela no espaço da imagem
+      o.quaternion.premultiply(q.setFromAxisAngle(dir, T.MathUtils.degToRad(graus)));
+    };
+    let ini = null;
+    window.addEventListener('pointerdown', e => {
+      if (e.target.closest && e.target.closest('#hud')) return; // toques nos botões não giram nem quebram
+      ini = { x: e.clientX, y: e.clientY, total: 0 };
+    });
+    window.addEventListener('pointermove', e => {
+      if (!ini) return;
+      ini.total += Math.abs(e.clientX - ini.x) + Math.abs(e.clientY - ini.y);
+      if (ini.total > 10) { // só gira depois de arrastar um pouco (senão é um toque)
+        girar(CIMA, (e.clientX - ini.x) * 0.5);    // arrastar para os lados
+        girar(DIREITA, (e.clientY - ini.y) * 0.5); // arrastar para cima/baixo
+      }
+      ini.x = e.clientX; ini.y = e.clientY;
+    });
+    window.addEventListener('pointerup', e => {
+      if (ini && ini.total <= 10) tocar(e); // toque rápido = quebrar/colocar
+      ini = null;
+    });
+    window.addEventListener('pointercancel', () => ini = null);
+
+    // ===== Quebrar e colocar blocos =====
+    const TIPOS_COLOCAR = [
+      ['tabuas', '🪵 Tábuas'], ['pedregulho', '🪨 Pedregulho'], ['pedra', '⬜ Pedra'],
+      ['tronco', '🌳 Tronco'], ['folhas', '🍃 Folhas'], ['grama', '🟩 Grama'],
+      ['terra', '🟫 Terra'], ['areia', '🟨 Areia'], ['agua', '💧 Água']
+    ];
+    let colocando = false, tipoAtual = 0;
+    const btnModo = document.getElementById('modo');
+    const btnTipo = document.getElementById('tipo');
+    const dica = document.getElementById('dica');
+    const raycaster = new T.Raycaster(), ponto = new T.Vector2();
+    const cena = document.querySelector('a-scene');
+
+    btnModo.addEventListener('click', () => {
+      colocando = !colocando;
+      btnModo.textContent = colocando ? '🧱 Colocar' : '⛏️ Quebrar';
+      btnModo.className = colocando ? 'colocar' : 'quebrar';
+      btnTipo.style.display = colocando ? '' : 'none';
+      dica.textContent = colocando
+        ? 'Toque na face de um bloco para colocar outro ali · arraste para girar'
+        : 'Toque num bloco para quebrar · arraste para girar';
+    });
+    btnTipo.addEventListener('click', () => {
+      tipoAtual = (tipoAtual + 1) % TIPOS_COLOCAR.length;
+      btnTipo.textContent = TIPOS_COLOCAR[tipoAtual][1];
+    });
+    document.getElementById('reiniciar').addEventListener('click', () => {
+      mundo.components['mundo-de-blocos'].reiniciar();
+      mundo.object3D.rotation.set(T.MathUtils.degToRad(90), 0, 0); // volta o giro ao original
+    });
+
+    function tocar(e) {
+      const comp = mundo.components['mundo-de-blocos'];
+      if (!comp || !alvo.object3D.visible) return; // imagem não está sendo vista
+
+      // converte o ponto tocado para coordenadas da cena (-1 a 1)
+      const r = cena.canvas.getBoundingClientRect();
+      ponto.set(((e.clientX - r.left) / r.width) * 2 - 1, -((e.clientY - r.top) / r.height) * 2 + 1);
+      comp.grupo.updateMatrixWorld(true); // garante que blocos recém-colocados já possam ser tocados
+      raycaster.setFromCamera(ponto, cena.camera);
+      const hit = raycaster.intersectObjects(comp.grupo.children, false)[0];
+      if (!hit) return;
+
+      const b = hit.object.userData;
+      let ok;
+      if (colocando) {
+        // o novo bloco vai encostado na face tocada
+        const n = hit.face.normal;
+        const x = b.x + Math.round(n.x), y = b.y + Math.round(n.y), z = b.z + Math.round(n.z);
+        if (y < 1 || y > 15 || x < -4 || x > 11 || z < -4 || z > 11) return; // limite do mundo
+        ok = comp.colocar(TIPOS_COLOCAR[tipoAtual][0], x, y, z);
+      } else {
+        ok = comp.quebrar(hit.object);
+      }
+      if (ok && navigator.vibrate) navigator.vibrate(25); // tremidinha no celular
+    }
+  </script>
+</body>
+</html>
